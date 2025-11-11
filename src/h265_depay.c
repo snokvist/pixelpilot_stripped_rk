@@ -52,6 +52,7 @@ static const guint8 kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
 static void sstar_h265_depay_reset_state(SstarH265Depay *self);
 static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstBuffer *buffer);
 static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstEvent *event);
+static GstCaps *sstar_h265_depay_build_src_caps(void);
 
 static inline guint64 extend_timestamp(SstarH265Depay *self, guint32 ts) {
     if (!self->have_last_ts) {
@@ -394,6 +395,13 @@ done:
     return ret;
 }
 
+static GstCaps *sstar_h265_depay_build_src_caps(void) {
+    return gst_caps_new_simple("video/x-h265",
+                               "stream-format", G_TYPE_STRING, "byte-stream",
+                               "alignment", G_TYPE_STRING, "au",
+                               NULL);
+}
+
 static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstEvent *event) {
     SstarH265Depay *self = SSTAR_H265_DEPAY(parent);
     gboolean forward = TRUE;
@@ -410,6 +418,22 @@ static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstE
         finish_current_au(self, self->au_corrupted);
         forward = gst_pad_push_event(self->srcpad, event);
         break;
+    case GST_EVENT_CAPS: {
+        gst_event_unref(event);
+        GstCaps *outcaps = sstar_h265_depay_build_src_caps();
+        if (outcaps == NULL) {
+            forward = FALSE;
+            break;
+        }
+        GstEvent *caps_event = gst_event_new_caps(outcaps);
+        gst_caps_unref(outcaps);
+        if (caps_event == NULL) {
+            forward = FALSE;
+            break;
+        }
+        forward = gst_pad_push_event(self->srcpad, caps_event);
+        break;
+    }
     default:
         forward = gst_pad_push_event(self->srcpad, event);
         break;
