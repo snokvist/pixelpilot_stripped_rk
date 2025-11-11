@@ -40,6 +40,9 @@ typedef struct {
     GMutex recorder_lock;
 
     const AppCfg *cfg;
+
+    gint64 queue_overruns;
+    gint64 queue_underruns;
 } PipelineState;
 
 typedef struct PipelineRecordingStats {

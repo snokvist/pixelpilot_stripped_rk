@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -30,6 +32,12 @@ struct UdpReceiver {
     gboolean stop_requested;
     GstBufferPool *pool;
     gboolean pool_active;
+#ifdef SO_RXQ_OVFL
+    guint32 last_overflow_count;
+    guint64 total_overflow_events;
+#endif
+    guint64 total_packets;
+    guint64 truncated_packets;
 };
 
 static gboolean ensure_buffer_pool(UdpReceiver *ur) {
@@ -99,7 +107,21 @@ static gpointer receiver_thread(gpointer data) {
             break;
         }
 
-        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, 0);
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        struct iovec iov;
+        iov.iov_base = buffer;
+        iov.iov_len = UDP_MAX_PACKET;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+#ifdef SO_RXQ_OVFL
+        guint8 control[CMSG_SPACE(sizeof(guint32))];
+        memset(control, 0, sizeof(control));
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+#endif
+
+        ssize_t n = recvmsg(ur->sockfd, &msg, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 continue;
@@ -110,9 +132,49 @@ static gpointer receiver_thread(gpointer data) {
         if (n == 0) {
             continue;
         }
+
+#ifdef SO_RXQ_OVFL
+        guint32 overflow_value = 0;
+        gboolean overflow_present = FALSE;
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_RXQ_OVFL &&
+                cmsg->cmsg_len >= CMSG_LEN(sizeof(guint32))) {
+                overflow_value = *((guint32 *)CMSG_DATA(cmsg));
+                overflow_present = TRUE;
+                break;
+            }
+        }
+        if (overflow_present) {
+            guint32 previous = ur->last_overflow_count;
+            guint32 delta;
+            if (overflow_value >= previous) {
+                delta = overflow_value - previous;
+            } else {
+                delta = (G_MAXUINT32 - previous) + 1 + overflow_value;
+            }
+            ur->last_overflow_count = overflow_value;
+            if (delta > 0) {
+                ur->total_overflow_events += delta;
+                LOGW("UDP receiver: kernel dropped %u datagrams before delivery (total=%" G_GUINT64_FORMAT ")", delta,
+                     ur->total_overflow_events);
+            }
+        }
+#endif
+
+        if ((msg.msg_flags & MSG_TRUNC) != 0) {
+            ur->truncated_packets++;
+            if (ur->truncated_packets <= 5 || (ur->truncated_packets % 1000) == 0) {
+                LOGW("UDP receiver: truncated RTP datagram detected (size=%zd, total truncations=%" G_GUINT64_FORMAT ")", n,
+                     ur->truncated_packets);
+            }
+            continue;
+        }
+
         if (!payload_type_matches(buffer, n, ur->vid_pt)) {
             continue;
         }
+
+        ur->total_packets++;
 
         GstBuffer *gst_buf = NULL;
         if (ensure_buffer_pool(ur)) {
@@ -177,6 +239,12 @@ UdpReceiver *udp_receiver_create(int udp_port, int vid_pt, GstAppSrc *video_apps
     ur->thread = NULL;
     ur->pool = NULL;
     ur->pool_active = FALSE;
+#ifdef SO_RXQ_OVFL
+    ur->last_overflow_count = 0;
+    ur->total_overflow_events = 0;
+#endif
+    ur->total_packets = 0;
+    ur->truncated_packets = 0;
 
     return ur;
 }

@@ -118,3 +118,20 @@ PIXELPILOT_H265_DEPAY_STATS_MS=500 GST_DEBUG=sstarh265depay:5 \
 ```
 
 Use a value of `0` to silence the summary while keeping on-demand warnings for individual damaged frames.
+
+#### Transport diagnostics
+
+To distinguish on-air packet loss from drops that happen inside the player, the UDP ingest path now exposes two additional
+signals:
+
+* The socket reader upgrades to `recvmsg()` and inspects Linux's `SO_RXQ_OVFL` control messages. Whenever the kernel discards
+  datagrams because the UDP receive queue overflows, the application prints a warning that includes both the number of packets
+  lost in the most recent burst and the running total since the socket was created. Truncated datagrams (larger than the
+  configured 4&nbsp;KiB RTP buffer) are detected and reported as well.
+* The intermediate `queue` element enables its `signal-emits` property so `overrun`/`underrun` notifications reach the log. An
+  overrun means the queue exhausted its 16-buffer budget and had to drop data to keep the network thread unblocked; an underrun
+  indicates downstream pulled faster than upstream produced buffers. Both signals log their running counts, letting operators
+  correlate depayloader corruption with local back-pressure.
+
+Taken together with the depayloader's RTP sequence diagnostics, these logs make it easier to decide whether residual artifacts
+stem from RF issues, kernel-level drops, or the application's own queue policy.

@@ -33,6 +33,37 @@ static void ensure_gst_initialized(void) {
     }
 }
 
+static gboolean should_log_counter(gint64 count) {
+    if (count <= 0) {
+        return FALSE;
+    }
+    if (count <= 5) {
+        return TRUE;
+    }
+    if ((count <= 50 && (count % 10) == 0) || (count % 50) == 0) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void queue_overrun_cb(GstElement *queue, gpointer user_data) {
+    (void)queue;
+    PipelineState *ps = (PipelineState *)user_data;
+    gint64 new_count = ps != NULL ? g_atomic_int64_add(&ps->queue_overruns, 1) + 1 : 1;
+    if (should_log_counter(new_count)) {
+        LOGW("UDP queue overrun detected (total=%" G_GINT64_FORMAT ") — downstream is not keeping up", new_count);
+    }
+}
+
+static void queue_underrun_cb(GstElement *queue, gpointer user_data) {
+    (void)queue;
+    PipelineState *ps = (PipelineState *)user_data;
+    gint64 new_count = ps != NULL ? g_atomic_int64_add(&ps->queue_underruns, 1) + 1 : 1;
+    if (should_log_counter(new_count)) {
+        LOGI("UDP queue underrun detected (total=%" G_GINT64_FORMAT ") — upstream starved the pipeline", new_count);
+    }
+}
+
 static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiver_out) {
     if (cfg == NULL || receiver_out == NULL) {
         return NULL;
@@ -252,6 +283,8 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     ps->appsink_thread_running = FALSE;
     ps->stop_requested = FALSE;
     ps->encountered_error = FALSE;
+    ps->queue_overruns = 0;
+    ps->queue_underruns = 0;
 
     GstElement *pipeline = gst_pipeline_new("pixelpilot_stripped_rk");
     CHECK_ELEM(pipeline, "pipeline");
@@ -318,11 +351,14 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     gst_caps_unref(raw_caps);
 
     g_object_set(queue,
+                 "signal-emits", TRUE,
                  "leaky", 2,
                  "max-size-time", (guint64)0,
                  "max-size-bytes", (guint64)0,
                  "max-size-buffers", 16,
                  NULL);
+    g_signal_connect(queue, "overrun", G_CALLBACK(queue_overrun_cb), ps);
+    g_signal_connect(queue, "underrun", G_CALLBACK(queue_underrun_cb), ps);
 
     gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, depay, parser, capsfilter, appsink, NULL);
     if (!gst_element_link_many(appsrc, queue, depay, parser, capsfilter, appsink, NULL)) {
