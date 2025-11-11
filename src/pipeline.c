@@ -351,7 +351,7 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     gst_caps_unref(raw_caps);
 
     g_object_set(queue,
-                 "signal-emits", TRUE,
+                 "emit-signals", TRUE,
                  "leaky", 2,
                  "max-size-time", (guint64)0,
                  "max-size-bytes", (guint64)0,
