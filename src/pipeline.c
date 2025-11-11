@@ -1,6 +1,8 @@
 #include "pipeline.h"
 
 #include "logging.h"
+#include "h265_depay.h"
+#include "h265_parse.h"
 
 #ifndef GST_USE_UNSTABLE_API
 #define GST_USE_UNSTABLE_API
@@ -28,6 +30,37 @@ static void ensure_gst_initialized(void) {
     if (g_once_init_enter(&once_init)) {
         gst_init(NULL, NULL);
         g_once_init_leave(&once_init, 1);
+    }
+}
+
+static gboolean should_log_counter(gint count) {
+    if (count <= 0) {
+        return FALSE;
+    }
+    if (count <= 5) {
+        return TRUE;
+    }
+    if ((count <= 50 && (count % 10) == 0) || (count % 50) == 0) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void queue_overrun_cb(GstElement *queue, gpointer user_data) {
+    (void)queue;
+    PipelineState *ps = (PipelineState *)user_data;
+    gint new_count = ps != NULL ? g_atomic_int_add(&ps->queue_overruns, 1) + 1 : 1;
+    if (should_log_counter(new_count)) {
+        LOGW("UDP queue overrun detected (total=%" G_GINT32_FORMAT ") — downstream is not keeping up", new_count);
+    }
+}
+
+static void queue_underrun_cb(GstElement *queue, gpointer user_data) {
+    (void)queue;
+    PipelineState *ps = (PipelineState *)user_data;
+    gint new_count = ps != NULL ? g_atomic_int_add(&ps->queue_underruns, 1) + 1 : 1;
+    if (should_log_counter(new_count)) {
+        LOGI("UDP queue underrun detected (total=%" G_GINT32_FORMAT ") — upstream starved the pipeline", new_count);
     }
 }
 
@@ -121,6 +154,11 @@ static gpointer appsink_thread_func(gpointer data) {
             GstMapInfo map;
             if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
                 if (map.size > 0 && map.size <= max_packet) {
+                    gboolean corrupted = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED);
+                    gboolean discont = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT);
+                    if (discont) {
+                        corrupted = TRUE;
+                    }
                     g_mutex_lock(&ps->recorder_lock);
                     VideoRecorder *recorder = ps->recorder;
                     if (recorder != NULL) {
@@ -128,7 +166,7 @@ static gpointer appsink_thread_func(gpointer data) {
                     }
                     g_mutex_unlock(&ps->recorder_lock);
 
-                    if (video_decoder_feed(ps->decoder, map.data, map.size, pts) != 0) {
+                    if (video_decoder_feed(ps->decoder, map.data, map.size, pts, corrupted, discont) != 0) {
                         LOGV("Video decoder feed busy; retrying");
                     }
                 }
@@ -245,6 +283,8 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     ps->appsink_thread_running = FALSE;
     ps->stop_requested = FALSE;
     ps->encountered_error = FALSE;
+    ps->queue_overruns = 0;
+    ps->queue_underruns = 0;
 
     GstElement *pipeline = gst_pipeline_new("pixelpilot_stripped_rk");
     CHECK_ELEM(pipeline, "pipeline");
@@ -255,26 +295,48 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
         goto fail;
     }
 
+    if (!sstar_h265_depay_register()) {
+        LOGE("Failed to register sstarh265depay element");
+        goto fail;
+    }
+
+    if (!sstar_h265_parse_register()) {
+        LOGE("Failed to register sstarh265parse element");
+        goto fail;
+    }
+
     GstElement *queue = gst_element_factory_make("queue", "udp_queue");
-    GstElement *depay = gst_element_factory_make("rtph265depay", "video_depay");
-    GstElement *parser = gst_element_factory_make("h265parse", "video_parser");
+    GstElement *depay = gst_element_factory_make("sstarh265depay", "video_depay");
+    GstElement *parser = gst_element_factory_make("sstarh265parse", "video_parser");
     GstElement *capsfilter = gst_element_factory_make("capsfilter", "video_capsfilter");
     GstElement *appsink = gst_element_factory_make("appsink", "video_sink");
 
     CHECK_ELEM(queue, "queue");
-    CHECK_ELEM(depay, "rtph265depay");
-    CHECK_ELEM(parser, "h265parse");
+    CHECK_ELEM(depay, "sstarh265depay");
+    CHECK_ELEM(parser, "sstarh265parse");
     CHECK_ELEM(capsfilter, "capsfilter");
     CHECK_ELEM(appsink, "appsink");
+
+    if (cfg->vid_pt >= -1 && cfg->vid_pt <= 127) {
+        g_object_set(depay, "payload-type", cfg->vid_pt, NULL);
+    }
+    g_object_set(depay, "emit-partial-au", TRUE, NULL);
+
+    const gchar *stats_env = g_getenv("PIXELPILOT_H265_DEPAY_STATS_MS");
+    if (stats_env != NULL && stats_env[0] != '\0') {
+        gchar *endptr = NULL;
+        guint64 parsed = g_ascii_strtoull(stats_env, &endptr, 10);
+        if (endptr != NULL && *endptr == '\0' && parsed <= G_MAXUINT) {
+            g_object_set(depay, "stats-interval-ms", (guint)parsed, NULL);
+        } else {
+            LOGW("Ignoring PIXELPILOT_H265_DEPAY_STATS_MS='%s' (invalid value)", stats_env);
+        }
+    }
 
     guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 4u;
     gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), max_buffers);
     gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);
     g_object_set(appsink, "sync", FALSE, NULL);
-
-    g_object_set(parser, "config-interval", -1, "disable-passthrough", TRUE, NULL);
-    gst_util_set_object_arg(G_OBJECT(parser), "stream-format", "byte-stream");
-    gst_util_set_object_arg(G_OBJECT(parser), "alignment", "au");
 
     GstCaps *raw_caps = gst_caps_new_simple("video/x-h265",
                                             "stream-format", G_TYPE_STRING, "byte-stream",
@@ -289,11 +351,14 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     gst_caps_unref(raw_caps);
 
     g_object_set(queue,
+                 "emit-signals", TRUE,
                  "leaky", 2,
                  "max-size-time", (guint64)0,
                  "max-size-bytes", (guint64)0,
                  "max-size-buffers", 16,
                  NULL);
+    g_signal_connect(queue, "overrun", G_CALLBACK(queue_overrun_cb), ps);
+    g_signal_connect(queue, "underrun", G_CALLBACK(queue_underrun_cb), ps);
 
     gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, depay, parser, capsfilter, appsink, NULL);
     if (!gst_element_link_many(appsrc, queue, depay, parser, capsfilter, appsink, NULL)) {

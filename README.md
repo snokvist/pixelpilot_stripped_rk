@@ -74,7 +74,7 @@ when targeting CPUs without NEON support.
 
 1. `atomic_modeset_maxhz` selects the highest refresh mode for the requested connector and commits the target plane.
 2. The UDP helper listens for RTP/H.265 packets on the configured port and payload type, pushing them into an `appsrc`.
-3. A small GStreamer pipeline (`appsrc → queue → rtph265depay → h265parse → appsink`) forwards access units to the appsink.
+3. A small GStreamer pipeline (`appsrc → queue → sstarh265depay → sstarh265parse → capsfilter → appsink`) forwards access units to the appsink.
 4. The appsink thread feeds the Rockchip MPP decoder and, when enabled, the minimp4 writer.
 
 Press `Ctrl+C` to shut the process down cleanly; send `SIGHUP` if you need to restart the video pipeline without exiting.
@@ -86,3 +86,52 @@ Press `Ctrl+C` to shut the process down cleanly; send `SIGHUP` if you need to re
 - `SIGINT` — graceful shutdown (default behaviour for `Ctrl+C`).
 - `SIGHUP` — restart the playback pipeline without exiting.
 - `SIGTERM` — graceful shutdown of the process.
+
+### GStreamer pipeline details
+
+The in-process pipeline is assembled dynamically at startup once `sstarh265parse` has been registered:
+
+1. `appsrc` exposes the RTP stream produced by the custom UDP receiver as `application/x-rtp` buffers.
+2. `queue` absorbs small bursts without back-pressuring the network reader.
+3. `sstarh265depay` assembles Annex-B access units from RTP payloads, supporting single NAL, aggregation, and fragmentation packets while keeping each AU contiguous for downstream consumers; the element is configured to forward partially recovered frames with the appropriate buffer flags when packet loss occurs.
+4. `sstarh265parse` is a lightweight passthrough element that enforces byte-stream caps and keeps every buffer in place, ensuring zero-copy hand-off to the rest of the pipeline.
+5. `capsfilter` advertises `video/x-h265, stream-format=byte-stream, alignment=au` downstream so that the appsink (and the Rockchip decoder) always observe consistent caps.
+6. `appsink` owns the decoded access units, forwarding them to the Rockchip MPP decoder and (optionally) the MP4 recorder thread.
+
+The parser element is intentionally minimal: it inherits from `GstBaseTransform`, runs in-place, and only negotiates caps so that the downstream components receive AU-aligned byte-stream data. This keeps latency and CPU usage close to the original `rtph265depay → appsink` arrangement while avoiding the heavier stock `h265parse` element.
+
+#### Depayloader loss handling
+
+`sstarh265depay` normally drops any access unit that ends up incomplete—for example, when a fragment from a fragmented unit (FU) is missing or arrives with the wrong payload type. The in-process pipeline enables the element property `emit-partial-au=true` so that partially reassembled frames still reach the decoder. Damaged access units keep the incomplete slices stripped but they are forwarded with `DISCONT` and `CORRUPTED` flags, allowing downstream components to make an informed decision.
+
+On RK3566 the video path uses those flags to hint the Rockchip MPP decoder that a buffer lost data mid-frame. Each corrupted access unit is wrapped into an `MppPacket` with `errinfo` asserted so the hardware outputs whatever slices survived while continuing to request fresh frames. This produces visible gaps where slices are missing but keeps the rest of the picture alive until the encoder delivers a clean IDR. Operators that prefer to discard damaged frames entirely can revert to the previous behaviour by clearing `emit-partial-au` when constructing the pipeline.
+
+#### Depayloader diagnostics
+
+When bursts of packet loss still leak visible corruption, enable GStreamer's warning logs for `sstarh265depay`. The depayloader now tags every forced AU flush with reason codes such as `fu-missing-end`, `timestamp-forced`, or `payload-trunc` and emits structured warnings whenever a damaged AU is forwarded or dropped. It also aggregates counters (total, corrupted, partial, and dropped AUs together with RTP header failures and FU gaps) and prints them every second by default. Sequence-number diagnostics are included in the report (`seq-lost`, `seq-dup`, and `seq-reorder`), and any RTP gap is highlighted with a warning that records the last and current sequence numbers so you can pinpoint upstream packet loss or reordering events.
+
+Set the element property `stats-interval-ms` to tune or disable the periodic summary. The runtime honours the environment variable `PIXELPILOT_H265_DEPAY_STATS_MS` when it creates the depayloader:
+
+```bash
+PIXELPILOT_H265_DEPAY_STATS_MS=500 GST_DEBUG=sstarh265depay:5 \
+    ./pixelpilot_stripped_rk --config config/sample.ini
+```
+
+Use a value of `0` to silence the summary while keeping on-demand warnings for individual damaged frames.
+
+#### Transport diagnostics
+
+To distinguish on-air packet loss from drops that happen inside the player, the UDP ingest path now exposes two additional
+signals:
+
+* The socket reader upgrades to `recvmsg()` and inspects Linux's `SO_RXQ_OVFL` control messages. Whenever the kernel discards
+  datagrams because the UDP receive queue overflows, the application prints a warning that includes both the number of packets
+  lost in the most recent burst and the running total since the socket was created. Truncated datagrams (larger than the
+  configured 4&nbsp;KiB RTP buffer) are detected and reported as well.
+* The intermediate `queue` element enables its `emit-signals` property so `overrun`/`underrun` notifications reach the log. An
+  overrun means the queue exhausted its 16-buffer budget and had to drop data to keep the network thread unblocked; an underrun
+  indicates downstream pulled faster than upstream produced buffers. Both signals log their running counts, letting operators
+  correlate depayloader corruption with local back-pressure.
+
+Taken together with the depayloader's RTP sequence diagnostics, these logs make it easier to decide whether residual artifacts
+stem from RF issues, kernel-level drops, or the application's own queue policy.
