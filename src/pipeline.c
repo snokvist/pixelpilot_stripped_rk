@@ -33,7 +33,7 @@ static void ensure_gst_initialized(void) {
     }
 }
 
-static gboolean should_log_counter(gint64 count) {
+static gboolean should_log_counter(gint count) {
     if (count <= 0) {
         return FALSE;
     }
@@ -49,18 +49,18 @@ static gboolean should_log_counter(gint64 count) {
 static void queue_overrun_cb(GstElement *queue, gpointer user_data) {
     (void)queue;
     PipelineState *ps = (PipelineState *)user_data;
-    gint64 new_count = ps != NULL ? g_atomic_int64_add(&ps->queue_overruns, 1) + 1 : 1;
+    gint new_count = ps != NULL ? g_atomic_int_add(&ps->queue_overruns, 1) + 1 : 1;
     if (should_log_counter(new_count)) {
-        LOGW("UDP queue overrun detected (total=%" G_GINT64_FORMAT ") — downstream is not keeping up", new_count);
+        LOGW("UDP queue overrun detected (total=%" G_GINT32_FORMAT ") — downstream is not keeping up", new_count);
     }
 }
 
 static void queue_underrun_cb(GstElement *queue, gpointer user_data) {
     (void)queue;
     PipelineState *ps = (PipelineState *)user_data;
-    gint64 new_count = ps != NULL ? g_atomic_int64_add(&ps->queue_underruns, 1) + 1 : 1;
+    gint new_count = ps != NULL ? g_atomic_int_add(&ps->queue_underruns, 1) + 1 : 1;
     if (should_log_counter(new_count)) {
-        LOGI("UDP queue underrun detected (total=%" G_GINT64_FORMAT ") — upstream starved the pipeline", new_count);
+        LOGI("UDP queue underrun detected (total=%" G_GINT32_FORMAT ") — upstream starved the pipeline", new_count);
     }
 }
 

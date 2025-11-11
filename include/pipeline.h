@@ -41,8 +41,8 @@ typedef struct {
 
     const AppCfg *cfg;
 
-    gint64 queue_overruns;
-    gint64 queue_underruns;
+    gint queue_overruns;
+    gint queue_underruns;
 } PipelineState;
 
 typedef struct PipelineRecordingStats {
