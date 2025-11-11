@@ -49,6 +49,9 @@ struct _SstarH265Depay {
 
     guint64 au_sequence;
 
+    gboolean have_last_seq;
+    guint64 last_seq_ext;
+
     guint64 stats_total_aus;
     guint64 stats_corrupted_aus;
     guint64 stats_partial_aus;
@@ -57,6 +60,9 @@ struct _SstarH265Depay {
     guint64 stats_fu_failures;
     guint64 stats_truncated_payloads;
     guint64 stats_forced_finishes;
+    guint64 stats_seq_lost;
+    guint64 stats_seq_out_of_order;
+    guint64 stats_seq_duplicates;
 
     gint64 stats_last_report_us;
     guint stats_interval_ms;
@@ -85,6 +91,11 @@ static void sstar_h265_depay_mark_corruption(SstarH265Depay *self, SstarH265Corr
 static void sstar_h265_depay_note_forced_close(SstarH265Depay *self, SstarH265CorruptionFlags flags);
 static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force);
 static gchar *sstar_h265_depay_describe_flags(guint32 flags);
+static guint64 sstar_h265_depay_extend_seq(SstarH265Depay *self, guint16 seq);
+static void sstar_h265_depay_track_sequence(SstarH265Depay *self,
+                                            guint16 seq,
+                                            guint32 timestamp,
+                                            gboolean marker);
 
 static inline guint64 extend_timestamp(SstarH265Depay *self, guint32 ts) {
     if (!self->have_last_ts) {
@@ -105,6 +116,76 @@ static inline guint64 extend_timestamp(SstarH265Depay *self, guint32 ts) {
     }
     self->last_ts_ext = candidate;
     return candidate;
+}
+
+static guint64 sstar_h265_depay_extend_seq(SstarH265Depay *self, guint16 seq) {
+    if (!self->have_last_seq) {
+        return seq;
+    }
+
+    guint16 prev = (guint16)(self->last_seq_ext & 0xffffu);
+    guint64 base = self->last_seq_ext & ~0xffffull;
+    guint64 candidate = base | seq;
+
+    if (seq < prev && (prev - seq) > 0x8000u) {
+        candidate += (1ull << 16);
+    } else if (seq > prev && (seq - prev) > 0x8000u) {
+        if (candidate >= (1ull << 16)) {
+            candidate -= (1ull << 16);
+        }
+    }
+
+    return candidate;
+}
+
+static void sstar_h265_depay_track_sequence(SstarH265Depay *self,
+                                            guint16 seq,
+                                            guint32 timestamp,
+                                            gboolean marker) {
+    guint64 seq_ext = sstar_h265_depay_extend_seq(self, seq);
+
+    if (self->have_last_seq) {
+        gint64 delta = (gint64)seq_ext - (gint64)self->last_seq_ext;
+
+        if (delta == 0) {
+            self->stats_seq_duplicates++;
+            GST_INFO_OBJECT(self,
+                            "Duplicate RTP packet detected: seq=%" G_GUINT64_FORMAT " ts=%u marker=%d",
+                            seq_ext,
+                            timestamp,
+                            marker);
+        } else if (delta > 0) {
+            if (delta > 1) {
+                guint64 missing = (guint64)(delta - 1);
+                self->stats_seq_lost += missing;
+                GST_WARNING_OBJECT(self,
+                                   "RTP sequence gap: last=%" G_GUINT64_FORMAT " current=%" G_GUINT64_FORMAT
+                                   " missing=%" G_GUINT64_FORMAT " ts=%u marker=%d au=%" G_GUINT64_FORMAT,
+                                   self->last_seq_ext,
+                                   seq_ext,
+                                   missing,
+                                   timestamp,
+                                   marker,
+                                   self->au_sequence);
+                if (self->current_fu != NULL) {
+                    GST_DEBUG_OBJECT(self,
+                                      "Gap occurred while FU assembly in progress (current FU bytes=%u)",
+                                      self->current_fu->len);
+                }
+            }
+        } else { /* delta < 0 */
+            self->stats_seq_out_of_order++;
+            GST_INFO_OBJECT(self,
+                            "Out-of-order RTP packet: seq=%" G_GUINT64_FORMAT " (delta=%" G_GINT64_FORMAT ") ts=%u marker=%d",
+                            seq_ext,
+                            delta,
+                            timestamp,
+                            marker);
+        }
+    }
+
+    self->last_seq_ext = seq_ext;
+    self->have_last_seq = TRUE;
 }
 
 static gboolean ensure_current_au(SstarH265Depay *self, guint64 ts_ext) {
@@ -356,7 +437,8 @@ static gboolean parse_rtp_payload(GstMapInfo *map,
                                   guint8 **payload_out,
                                   gsize *payload_len_out,
                                   guint32 *timestamp_out,
-                                  gboolean *marker_out) {
+                                  gboolean *marker_out,
+                                  guint16 *seq_out) {
     if (map->size < RTP_MIN_HEADER) {
         return FALSE;
     }
@@ -375,6 +457,7 @@ static gboolean parse_rtp_payload(GstMapInfo *map,
     guint8 mpt = data[1];
     gboolean marker = (mpt & 0x80u) != 0;
     guint8 payload_type = mpt & 0x7fu;
+    guint16 seq = ((guint16)data[2] << 8) | (guint16)data[3];
 
     if (expect_pt >= 0 && payload_type != (guint8)expect_pt) {
         return FALSE;
@@ -424,6 +507,9 @@ static gboolean parse_rtp_payload(GstMapInfo *map,
     *payload_len_out = payload_len;
     *timestamp_out = timestamp;
     *marker_out = marker;
+    if (seq_out != NULL) {
+        *seq_out = seq;
+    }
     return TRUE;
 }
 
@@ -439,10 +525,17 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
     gsize payload_len = 0;
     guint32 timestamp = 0;
     gboolean marker = FALSE;
+    guint16 seq = 0;
 
     GstFlowReturn ret = GST_FLOW_OK;
 
-    if (!parse_rtp_payload(&map, self->payload_type, &payload, &payload_len, &timestamp, &marker)) {
+    if (!parse_rtp_payload(&map,
+                           self->payload_type,
+                           &payload,
+                           &payload_len,
+                           &timestamp,
+                           &marker,
+                           &seq)) {
         GST_LOG_OBJECT(self, "Dropping packet: invalid RTP header or payload");
         if (self->have_au) {
             sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_RTP_HEADER);
@@ -451,6 +544,8 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
         }
         goto done;
     }
+
+    sstar_h265_depay_track_sequence(self, seq, timestamp, marker);
 
     guint64 ts_ext = extend_timestamp(self, timestamp);
 
@@ -584,10 +679,12 @@ static void sstar_h265_depay_reset_state(SstarH265Depay *self) {
     self->have_au = FALSE;
     self->have_last_ts = FALSE;
     self->have_base_ts = FALSE;
+    self->have_last_seq = FALSE;
     self->current_timestamp = 0;
     self->au_timestamp_ext = 0;
     self->last_ts_ext = 0;
     self->base_ts_ext = 0;
+    self->last_seq_ext = 0;
     self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
     self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
 }
@@ -675,6 +772,8 @@ static void sstar_h265_depay_init(SstarH265Depay *self) {
     self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
     self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
     self->au_sequence = 0;
+    self->have_last_seq = FALSE;
+    self->last_seq_ext = 0;
     self->stats_total_aus = 0;
     self->stats_corrupted_aus = 0;
     self->stats_partial_aus = 0;
@@ -683,6 +782,9 @@ static void sstar_h265_depay_init(SstarH265Depay *self) {
     self->stats_fu_failures = 0;
     self->stats_truncated_payloads = 0;
     self->stats_forced_finishes = 0;
+    self->stats_seq_lost = 0;
+    self->stats_seq_out_of_order = 0;
+    self->stats_seq_duplicates = 0;
     self->stats_last_report_us = 0;
     self->stats_interval_ms = 1000;
 }
@@ -778,7 +880,8 @@ static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force) {
 
     if (self->stats_total_aus == 0 && self->stats_corrupted_aus == 0 && self->stats_dropped_aus == 0 &&
         self->stats_rtp_failures == 0 && self->stats_fu_failures == 0 && self->stats_truncated_payloads == 0 &&
-        self->stats_forced_finishes == 0) {
+        self->stats_forced_finishes == 0 && self->stats_seq_lost == 0 && self->stats_seq_duplicates == 0 &&
+        self->stats_seq_out_of_order == 0) {
         if (force) {
             self->stats_last_report_us = now_us;
         }
@@ -788,7 +891,9 @@ static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force) {
     GST_INFO_OBJECT(self,
                     "stats: total=%" G_GUINT64_FORMAT " corrupted=%" G_GUINT64_FORMAT " partial=%" G_GUINT64_FORMAT
                     " dropped=%" G_GUINT64_FORMAT " rtp=%" G_GUINT64_FORMAT " fu-gaps=%" G_GUINT64_FORMAT
-                    " trunc=%" G_GUINT64_FORMAT " forced-closes=%" G_GUINT64_FORMAT,
+                    " trunc=%" G_GUINT64_FORMAT " forced-closes=%" G_GUINT64_FORMAT
+                    " seq-lost=%" G_GUINT64_FORMAT " seq-dup=%" G_GUINT64_FORMAT
+                    " seq-reorder=%" G_GUINT64_FORMAT,
                     self->stats_total_aus,
                     self->stats_corrupted_aus,
                     self->stats_partial_aus,
@@ -796,7 +901,10 @@ static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force) {
                     self->stats_rtp_failures,
                     self->stats_fu_failures,
                     self->stats_truncated_payloads,
-                    self->stats_forced_finishes);
+                    self->stats_forced_finishes,
+                    self->stats_seq_lost,
+                    self->stats_seq_duplicates,
+                    self->stats_seq_out_of_order);
 
     self->stats_total_aus = 0;
     self->stats_corrupted_aus = 0;
@@ -806,5 +914,8 @@ static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force) {
     self->stats_fu_failures = 0;
     self->stats_truncated_payloads = 0;
     self->stats_forced_finishes = 0;
+    self->stats_seq_lost = 0;
+    self->stats_seq_duplicates = 0;
+    self->stats_seq_out_of_order = 0;
     self->stats_last_report_us = now_us;
 }

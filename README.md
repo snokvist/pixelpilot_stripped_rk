@@ -108,7 +108,7 @@ On RK3566 the video path uses those flags to hint the Rockchip MPP decoder that 
 
 #### Depayloader diagnostics
 
-When bursts of packet loss still leak visible corruption, enable GStreamer's warning logs for `sstarh265depay`. The depayloader now tags every forced AU flush with reason codes such as `fu-missing-end`, `timestamp-forced`, or `payload-trunc` and emits structured warnings whenever a damaged AU is forwarded or dropped. It also aggregates counters (total, corrupted, partial, and dropped AUs together with RTP header failures and FU gaps) and prints them every second by default.
+When bursts of packet loss still leak visible corruption, enable GStreamer's warning logs for `sstarh265depay`. The depayloader now tags every forced AU flush with reason codes such as `fu-missing-end`, `timestamp-forced`, or `payload-trunc` and emits structured warnings whenever a damaged AU is forwarded or dropped. It also aggregates counters (total, corrupted, partial, and dropped AUs together with RTP header failures and FU gaps) and prints them every second by default. Sequence-number diagnostics are included in the report (`seq-lost`, `seq-dup`, and `seq-reorder`), and any RTP gap is highlighted with a warning that records the last and current sequence numbers so you can pinpoint upstream packet loss or reordering events.
 
 Set the element property `stats-interval-ms` to tune or disable the periodic summary. The runtime honours the environment variable `PIXELPILOT_H265_DEPAY_STATS_MS` when it creates the depayloader:
 
