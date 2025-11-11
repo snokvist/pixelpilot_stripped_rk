@@ -16,6 +16,12 @@
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_err.h>
 
+#if defined(__has_include)
+#  if __has_include(<rockchip/mpp_packet.h>)
+#    include <rockchip/mpp_packet.h>
+#  endif
+#endif
+
 #if defined(PIXELPILOT_DISABLE_NEON)
 #define PIXELPILOT_NEON_AVAILABLE 0
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(PIXELPILOT_HAS_NEON)
@@ -252,9 +258,9 @@ static void set_mpp_decoding_parameters(VideoDecoder *vd) {
 
     mpp_dec_cfg_deinit(cfg);
 
-    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_DISABLE_ERROR, 0xffff);
-    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_IMMEDIATE_OUT, 0xffff);
-    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_ENABLE_FAST_PLAY, 0xffff);
+    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_DISABLE_ERROR, 1);
+    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_IMMEDIATE_OUT, 1);
+    set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_ENABLE_FAST_PLAY, 1);
 }
 
 static int find_crtc_index(int fd, uint32_t crtc_id) {
@@ -919,7 +925,12 @@ void video_decoder_stop(VideoDecoder *vd) {
     }
 }
 
-int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size, GstClockTime pts) {
+int video_decoder_feed(VideoDecoder *vd,
+                       const guint8 *data,
+                       size_t size,
+                       GstClockTime pts,
+                       gboolean corrupted,
+                       gboolean discontinuity) {
     if (vd == NULL || !vd->running) {
         return -1;
     }
@@ -936,6 +947,10 @@ int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size, GstClo
     RK_S64 packet_pts = gst_pts_to_mpp_timestamp(pts);
     mpp_packet_set_pts(vd->packet, packet_pts);
     mpp_packet_set_dts(vd->packet, packet_pts);
+
+    mpp_packet_set_errinfo(vd->packet, corrupted ? 1 : 0);
+
+    (void)discontinuity;
 
     while (vd->running) {
         MPP_RET ret = vd->mpi->decode_put_packet(vd->ctx, vd->packet);
