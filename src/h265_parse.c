@@ -5,6 +5,15 @@
 #include <gst/base/gstbasetransform.h>
 #include <gst/gst.h>
 
+#ifndef G_GNUC_WEAK
+#define G_GNUC_WEAK
+#endif
+
+#if GST_CHECK_VERSION(1, 18, 0)
+G_GNUC_WEAK void gst_base_transform_class_set_passthrough_on_same_caps(GstBaseTransformClass *klass,
+                                                                       gboolean passthrough);
+#endif
+
 GST_DEBUG_CATEGORY_STATIC(sstar_h265_parse_debug);
 #define GST_CAT_DEFAULT sstar_h265_parse_debug
 
@@ -122,7 +131,11 @@ static void sstar_h265_parse_class_init(SstarH265ParseClass *klass) {
     base_class->set_caps = sstar_h265_parse_set_caps;
     base_class->transform_ip = sstar_h265_parse_transform_ip;
 #if GST_CHECK_VERSION(1, 18, 0)
-    gst_base_transform_class_set_passthrough_on_same_caps(base_class, TRUE);
+    if (gst_base_transform_class_set_passthrough_on_same_caps != NULL) {
+        gst_base_transform_class_set_passthrough_on_same_caps(base_class, TRUE);
+    } else {
+        base_class->passthrough_on_same_caps = TRUE;
+    }
 #else
     base_class->passthrough_on_same_caps = TRUE;
 #endif

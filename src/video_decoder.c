@@ -16,6 +16,12 @@
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_err.h>
 
+#ifndef G_GNUC_WEAK
+#define G_GNUC_WEAK
+#endif
+
+G_GNUC_WEAK void mpp_packet_set_errinfo(MppPacket packet, RK_U32 errinfo);
+
 #if defined(__has_include)
 #  if __has_include(<rockchip/mpp_packet.h>)
 #    include <rockchip/mpp_packet.h>
@@ -177,6 +183,17 @@ static inline void copy_packet_data(guint8 *dst, const guint8 *src, size_t size)
     if (size > 0) {
         memcpy(dst, src, size);
     }
+#endif
+}
+
+static inline void set_packet_errinfo_safe(MppPacket packet, gboolean corrupted) {
+#if defined(__GNUC__)
+    if (mpp_packet_set_errinfo != NULL) {
+        mpp_packet_set_errinfo(packet, corrupted ? 1 : 0);
+    }
+#else
+    (void)packet;
+    (void)corrupted;
 #endif
 }
 
@@ -948,7 +965,7 @@ int video_decoder_feed(VideoDecoder *vd,
     mpp_packet_set_pts(vd->packet, packet_pts);
     mpp_packet_set_dts(vd->packet, packet_pts);
 
-    mpp_packet_set_errinfo(vd->packet, corrupted ? 1 : 0);
+    set_packet_errinfo_safe(vd->packet, corrupted);
 
     (void)discontinuity;
 
