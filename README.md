@@ -105,3 +105,16 @@ The parser element is intentionally minimal: it inherits from `GstBaseTransform`
 `sstarh265depay` normally drops any access unit that ends up incomplete—for example, when a fragment from a fragmented unit (FU) is missing or arrives with the wrong payload type. The in-process pipeline enables the element property `emit-partial-au=true` so that partially reassembled frames still reach the decoder. Damaged access units keep the incomplete slices stripped but they are forwarded with `DISCONT` and `CORRUPTED` flags, allowing downstream components to make an informed decision.
 
 On RK3566 the video path uses those flags to hint the Rockchip MPP decoder that a buffer lost data mid-frame. Each corrupted access unit is wrapped into an `MppPacket` with `errinfo` asserted so the hardware outputs whatever slices survived while continuing to request fresh frames. This produces visible gaps where slices are missing but keeps the rest of the picture alive until the encoder delivers a clean IDR. Operators that prefer to discard damaged frames entirely can revert to the previous behaviour by clearing `emit-partial-au` when constructing the pipeline.
+
+#### Depayloader diagnostics
+
+When bursts of packet loss still leak visible corruption, enable GStreamer's warning logs for `sstarh265depay`. The depayloader now tags every forced AU flush with reason codes such as `fu-missing-end`, `timestamp-forced`, or `payload-trunc` and emits structured warnings whenever a damaged AU is forwarded or dropped. It also aggregates counters (total, corrupted, partial, and dropped AUs together with RTP header failures and FU gaps) and prints them every second by default.
+
+Set the element property `stats-interval-ms` to tune or disable the periodic summary. The runtime honours the environment variable `PIXELPILOT_H265_DEPAY_STATS_MS` when it creates the depayloader:
+
+```bash
+PIXELPILOT_H265_DEPAY_STATS_MS=500 GST_DEBUG=sstarh265depay:5 \
+    ./pixelpilot_stripped_rk --config config/sample.ini
+```
+
+Use a value of `0` to silence the summary while keeping on-demand warnings for individual damaged frames.

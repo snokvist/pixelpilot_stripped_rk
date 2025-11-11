@@ -289,6 +289,17 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     }
     g_object_set(depay, "emit-partial-au", TRUE, NULL);
 
+    const gchar *stats_env = g_getenv("PIXELPILOT_H265_DEPAY_STATS_MS");
+    if (stats_env != NULL && stats_env[0] != '\0') {
+        gchar *endptr = NULL;
+        guint64 parsed = g_ascii_strtoull(stats_env, &endptr, 10);
+        if (endptr != NULL && *endptr == '\0' && parsed <= G_MAXUINT) {
+            g_object_set(depay, "stats-interval-ms", (guint)parsed, NULL);
+        } else {
+            LOGW("Ignoring PIXELPILOT_H265_DEPAY_STATS_MS='%s' (invalid value)", stats_env);
+        }
+    }
+
     guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 4u;
     gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), max_buffers);
     gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);

@@ -11,6 +11,16 @@ GST_DEBUG_CATEGORY_STATIC(sstar_h265_depay_debug);
 #define H265_FU_NAL_TYPE 49
 #define RTP_CLOCK_RATE 90000
 
+typedef enum {
+    SSTAR_H265_CORRUPTION_NONE = 0,
+    SSTAR_H265_CORRUPTION_RTP_HEADER = 1u << 0,
+    SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC = 1u << 1,
+    SSTAR_H265_CORRUPTION_FU_MISSING_START = 1u << 2,
+    SSTAR_H265_CORRUPTION_FU_MISSING_END = 1u << 3,
+    SSTAR_H265_CORRUPTION_AP_TRUNC = 1u << 4,
+    SSTAR_H265_CORRUPTION_TIMESTAMP_FORCED = 1u << 5,
+} SstarH265CorruptionFlags;
+
 struct _SstarH265Depay {
     GstElement parent;
 
@@ -33,6 +43,23 @@ struct _SstarH265Depay {
     guint64 base_ts_ext;
 
     gboolean emit_partial_au;
+
+    guint32 corruption_flags;
+    guint32 forced_close_flags;
+
+    guint64 au_sequence;
+
+    guint64 stats_total_aus;
+    guint64 stats_corrupted_aus;
+    guint64 stats_partial_aus;
+    guint64 stats_dropped_aus;
+    guint64 stats_rtp_failures;
+    guint64 stats_fu_failures;
+    guint64 stats_truncated_payloads;
+    guint64 stats_forced_finishes;
+
+    gint64 stats_last_report_us;
+    guint stats_interval_ms;
 };
 
 struct _SstarH265DepayClass {
@@ -45,6 +72,7 @@ enum {
     PROP_0,
     PROP_PAYLOAD_TYPE,
     PROP_EMIT_PARTIAL_AU,
+    PROP_STATS_INTERVAL_MS,
 };
 
 static const guint8 kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
@@ -53,6 +81,10 @@ static void sstar_h265_depay_reset_state(SstarH265Depay *self);
 static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstBuffer *buffer);
 static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstEvent *event);
 static GstCaps *sstar_h265_depay_build_src_caps(void);
+static void sstar_h265_depay_mark_corruption(SstarH265Depay *self, SstarH265CorruptionFlags flags);
+static void sstar_h265_depay_note_forced_close(SstarH265Depay *self, SstarH265CorruptionFlags flags);
+static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force);
+static gchar *sstar_h265_depay_describe_flags(guint32 flags);
 
 static inline guint64 extend_timestamp(SstarH265Depay *self, guint32 ts) {
     if (!self->have_last_ts) {
@@ -110,6 +142,7 @@ static gboolean append_nal(SstarH265Depay *self, const guint8 *data, gsize size)
 static gboolean handle_single_nal(SstarH265Depay *self, const guint8 *payload, gsize len) {
     drop_current_fu(self);
     if (len < 2) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC);
         return FALSE;
     }
     if (self->current_au == NULL) {
@@ -121,6 +154,7 @@ static gboolean handle_single_nal(SstarH265Depay *self, const guint8 *payload, g
 static gboolean handle_ap(SstarH265Depay *self, const guint8 *payload, gsize len) {
     drop_current_fu(self);
     if (len <= 2) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_AP_TRUNC);
         return FALSE;
     }
     gsize offset = 2;
@@ -128,6 +162,7 @@ static gboolean handle_ap(SstarH265Depay *self, const guint8 *payload, gsize len
         guint16 nal_size = (guint16)((payload[offset] << 8) | payload[offset + 1]);
         offset += 2;
         if (offset + nal_size > len) {
+            sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_AP_TRUNC);
             return FALSE;
         }
         if (nal_size > 0) {
@@ -142,6 +177,7 @@ static gboolean handle_ap(SstarH265Depay *self, const guint8 *payload, gsize len
 
 static gboolean handle_fu(SstarH265Depay *self, const guint8 *payload, gsize len) {
     if (len < 3) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC);
         return FALSE;
     }
 
@@ -165,6 +201,7 @@ static gboolean handle_fu(SstarH265Depay *self, const guint8 *payload, gsize len
         g_byte_array_append(self->current_fu, kStartCode, sizeof(kStartCode));
         g_byte_array_append(self->current_fu, header, sizeof(header));
     } else if (self->current_fu == NULL) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_FU_MISSING_START);
         return FALSE;
     }
 
@@ -174,9 +211,11 @@ static gboolean handle_fu(SstarH265Depay *self, const guint8 *payload, gsize len
 
     if (end) {
         if (self->current_fu == NULL) {
+            sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_FU_MISSING_START);
             return FALSE;
         }
         if (self->current_au == NULL) {
+            sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC);
             return FALSE;
         }
         g_byte_array_append(self->current_au, self->current_fu->data, self->current_fu->len);
@@ -191,6 +230,7 @@ static gboolean depayload_nalu(SstarH265Depay *self, const guint8 *payload, gsiz
         return FALSE;
     }
     if (len < 2) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC);
         return FALSE;
     }
 
@@ -214,12 +254,15 @@ static GstFlowReturn finish_current_au(SstarH265Depay *self, gboolean drop) {
             g_byte_array_free(self->current_au, TRUE);
             self->current_au = NULL;
         }
+        self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
+        self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
         return GST_FLOW_OK;
     }
 
     gboolean corrupted = drop || self->au_corrupted;
 
     if (self->current_fu != NULL) {
+        sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_FU_MISSING_END);
         drop = TRUE;
         corrupted = TRUE;
         drop_current_fu(self);
@@ -227,12 +270,30 @@ static GstFlowReturn finish_current_au(SstarH265Depay *self, gboolean drop) {
 
     self->have_au = FALSE;
 
-    if ((drop && !self->emit_partial_au) || self->current_au == NULL || self->current_au->len == 0) {
+    gboolean should_drop = (drop && !self->emit_partial_au) || self->current_au == NULL || self->current_au->len == 0;
+
+    if (should_drop) {
+        if (corrupted) {
+            self->stats_corrupted_aus++;
+        }
+        self->stats_dropped_aus++;
+        if ((self->corruption_flags | self->forced_close_flags) != SSTAR_H265_CORRUPTION_NONE) {
+            gchar *desc = sstar_h265_depay_describe_flags(self->corruption_flags | self->forced_close_flags);
+            GST_WARNING_OBJECT(self,
+                               "Dropping AU seq=%" G_GUINT64_FORMAT " flags=%s",
+                               self->au_sequence,
+                               desc);
+            g_free(desc);
+        }
         self->au_corrupted = FALSE;
         if (self->current_au != NULL) {
             g_byte_array_free(self->current_au, TRUE);
             self->current_au = NULL;
         }
+        self->au_sequence++;
+        sstar_h265_depay_log_stats(self, FALSE);
+        self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
+        self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
         return GST_FLOW_OK;
     }
 
@@ -256,13 +317,37 @@ static GstFlowReturn finish_current_au(SstarH265Depay *self, gboolean drop) {
     GST_BUFFER_PTS(out) = pts;
     GST_BUFFER_DTS(out) = pts;
 
+    self->stats_total_aus++;
+
     if (corrupted) {
         GST_BUFFER_FLAG_SET(out, GST_BUFFER_FLAG_CORRUPTED);
         GST_BUFFER_FLAG_SET(out, GST_BUFFER_FLAG_DISCONT);
+        self->stats_corrupted_aus++;
+        if (drop) {
+            self->stats_partial_aus++;
+        }
     }
+
+    if ((self->corruption_flags | self->forced_close_flags) != SSTAR_H265_CORRUPTION_NONE) {
+        gchar *desc = sstar_h265_depay_describe_flags(self->corruption_flags | self->forced_close_flags);
+        GST_WARNING_OBJECT(self,
+                           "Emitting %s AU seq=%" G_GUINT64_FORMAT " pts=%" G_GUINT64_FORMAT " size=%" G_GSIZE_FORMAT
+                           " flags=%s",
+                           drop ? "partial" : "complete",
+                           self->au_sequence,
+                           (guint64)pts,
+                           size,
+                           desc);
+        g_free(desc);
+    }
+
+    self->au_sequence++;
 
     GstFlowReturn ret = gst_pad_push(self->srcpad, out);
     self->au_corrupted = FALSE;
+    self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
+    self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
+    sstar_h265_depay_log_stats(self, FALSE);
     return ret;
 }
 
@@ -360,7 +445,9 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
     if (!parse_rtp_payload(&map, self->payload_type, &payload, &payload_len, &timestamp, &marker)) {
         GST_LOG_OBJECT(self, "Dropping packet: invalid RTP header or payload");
         if (self->have_au) {
-            self->au_corrupted = TRUE;
+            sstar_h265_depay_mark_corruption(self, SSTAR_H265_CORRUPTION_RTP_HEADER);
+        } else {
+            self->stats_rtp_failures++;
         }
         goto done;
     }
@@ -368,7 +455,8 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
     guint64 ts_ext = extend_timestamp(self, timestamp);
 
     if (self->have_au && timestamp != self->current_timestamp) {
-        ret = finish_current_au(self, self->au_corrupted);
+        sstar_h265_depay_note_forced_close(self, SSTAR_H265_CORRUPTION_TIMESTAMP_FORCED);
+        ret = finish_current_au(self, TRUE);
         if (ret != GST_FLOW_OK) {
             goto done;
         }
@@ -411,11 +499,13 @@ static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstE
         forward = gst_pad_push_event(self->srcpad, event);
         break;
     case GST_EVENT_FLUSH_STOP:
+        sstar_h265_depay_log_stats(self, TRUE);
         sstar_h265_depay_reset_state(self);
         forward = gst_pad_push_event(self->srcpad, event);
         break;
     case GST_EVENT_EOS:
         finish_current_au(self, self->au_corrupted);
+        sstar_h265_depay_log_stats(self, TRUE);
         forward = gst_pad_push_event(self->srcpad, event);
         break;
     case GST_EVENT_CAPS: {
@@ -457,6 +547,9 @@ static void sstar_h265_depay_set_property(GObject *object, guint prop_id, const 
     case PROP_EMIT_PARTIAL_AU:
         self->emit_partial_au = g_value_get_boolean(value);
         break;
+    case PROP_STATS_INTERVAL_MS:
+        self->stats_interval_ms = (guint)g_value_get_uint(value);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
         break;
@@ -471,6 +564,9 @@ static void sstar_h265_depay_get_property(GObject *object, guint prop_id, GValue
         break;
     case PROP_EMIT_PARTIAL_AU:
         g_value_set_boolean(value, self->emit_partial_au);
+        break;
+    case PROP_STATS_INTERVAL_MS:
+        g_value_set_uint(value, self->stats_interval_ms);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -492,6 +588,8 @@ static void sstar_h265_depay_reset_state(SstarH265Depay *self) {
     self->au_timestamp_ext = 0;
     self->last_ts_ext = 0;
     self->base_ts_ext = 0;
+    self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
+    self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
 }
 
 static GstStaticPadTemplate sink_template =
@@ -532,6 +630,16 @@ static void sstar_h265_depay_class_init(SstarH265DepayClass *klass) {
                                                          FALSE,
                                                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(gobject_class,
+                                    PROP_STATS_INTERVAL_MS,
+                                    g_param_spec_uint("stats-interval-ms",
+                                                      "Statistics Interval (ms)",
+                                                      "How often to log depayloader corruption statistics (0 to disable)",
+                                                      0,
+                                                      60000,
+                                                      1000,
+                                                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     gst_element_class_set_static_metadata(element_class,
                                           "SStar H.265 depayloader",
                                           "Codec/Depayloader/Network",
@@ -564,6 +672,19 @@ static void sstar_h265_depay_init(SstarH265Depay *self) {
     self->last_ts_ext = 0;
     self->base_ts_ext = 0;
     self->emit_partial_au = FALSE;
+    self->corruption_flags = SSTAR_H265_CORRUPTION_NONE;
+    self->forced_close_flags = SSTAR_H265_CORRUPTION_NONE;
+    self->au_sequence = 0;
+    self->stats_total_aus = 0;
+    self->stats_corrupted_aus = 0;
+    self->stats_partial_aus = 0;
+    self->stats_dropped_aus = 0;
+    self->stats_rtp_failures = 0;
+    self->stats_fu_failures = 0;
+    self->stats_truncated_payloads = 0;
+    self->stats_forced_finishes = 0;
+    self->stats_last_report_us = 0;
+    self->stats_interval_ms = 1000;
 }
 
 gboolean sstar_h265_depay_register(void) {
@@ -577,4 +698,113 @@ gboolean sstar_h265_depay_register(void) {
     }
 
     return registered;
+}
+
+static void sstar_h265_depay_mark_corruption(SstarH265Depay *self, SstarH265CorruptionFlags flags) {
+    if (flags & SSTAR_H265_CORRUPTION_RTP_HEADER) {
+        self->stats_rtp_failures++;
+    }
+    if (flags & (SSTAR_H265_CORRUPTION_FU_MISSING_END | SSTAR_H265_CORRUPTION_FU_MISSING_START)) {
+        self->stats_fu_failures++;
+    }
+    if (flags & SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC) {
+        self->stats_truncated_payloads++;
+    }
+    if (flags & SSTAR_H265_CORRUPTION_TIMESTAMP_FORCED) {
+        self->stats_forced_finishes++;
+    }
+    self->corruption_flags |= flags;
+    self->au_corrupted = TRUE;
+}
+
+static void sstar_h265_depay_note_forced_close(SstarH265Depay *self, SstarH265CorruptionFlags flags) {
+    if (flags & SSTAR_H265_CORRUPTION_TIMESTAMP_FORCED) {
+        self->stats_forced_finishes++;
+    }
+    self->forced_close_flags |= flags;
+    self->au_corrupted = TRUE;
+}
+
+static gchar *sstar_h265_depay_describe_flags(guint32 flags) {
+    if (flags == SSTAR_H265_CORRUPTION_NONE) {
+        return g_strdup("none");
+    }
+
+    GString *desc = g_string_new(NULL);
+    if (flags & SSTAR_H265_CORRUPTION_RTP_HEADER) {
+        g_string_append(desc, "rtp-header;");
+    }
+    if (flags & SSTAR_H265_CORRUPTION_PAYLOAD_TRUNC) {
+        g_string_append(desc, "payload-trunc;");
+    }
+    if (flags & SSTAR_H265_CORRUPTION_FU_MISSING_START) {
+        g_string_append(desc, "fu-missing-start;");
+    }
+    if (flags & SSTAR_H265_CORRUPTION_FU_MISSING_END) {
+        g_string_append(desc, "fu-missing-end;");
+    }
+    if (flags & SSTAR_H265_CORRUPTION_AP_TRUNC) {
+        g_string_append(desc, "ap-trunc;");
+    }
+    if (flags & SSTAR_H265_CORRUPTION_TIMESTAMP_FORCED) {
+        g_string_append(desc, "timestamp-forced;");
+    }
+
+    if (desc->len == 0) {
+        g_string_assign(desc, "unknown");
+    }
+
+    /* remove trailing semicolon */
+    if (desc->len > 0 && desc->str[desc->len - 1] == ';') {
+        g_string_truncate(desc, desc->len - 1);
+    }
+
+    return g_string_free(desc, FALSE);
+}
+
+static void sstar_h265_depay_log_stats(SstarH265Depay *self, gboolean force) {
+    if (self->stats_interval_ms == 0) {
+        if (!force) {
+            return;
+        }
+    }
+
+    gint64 now_us = g_get_monotonic_time();
+    gint64 interval_us = (gint64)self->stats_interval_ms * 1000;
+
+    if (!force && self->stats_last_report_us != 0 && (now_us - self->stats_last_report_us) < interval_us) {
+        return;
+    }
+
+    if (self->stats_total_aus == 0 && self->stats_corrupted_aus == 0 && self->stats_dropped_aus == 0 &&
+        self->stats_rtp_failures == 0 && self->stats_fu_failures == 0 && self->stats_truncated_payloads == 0 &&
+        self->stats_forced_finishes == 0) {
+        if (force) {
+            self->stats_last_report_us = now_us;
+        }
+        return;
+    }
+
+    GST_INFO_OBJECT(self,
+                    "stats: total=%" G_GUINT64_FORMAT " corrupted=%" G_GUINT64_FORMAT " partial=%" G_GUINT64_FORMAT
+                    " dropped=%" G_GUINT64_FORMAT " rtp=%" G_GUINT64_FORMAT " fu-gaps=%" G_GUINT64_FORMAT
+                    " trunc=%" G_GUINT64_FORMAT " forced-closes=%" G_GUINT64_FORMAT,
+                    self->stats_total_aus,
+                    self->stats_corrupted_aus,
+                    self->stats_partial_aus,
+                    self->stats_dropped_aus,
+                    self->stats_rtp_failures,
+                    self->stats_fu_failures,
+                    self->stats_truncated_payloads,
+                    self->stats_forced_finishes);
+
+    self->stats_total_aus = 0;
+    self->stats_corrupted_aus = 0;
+    self->stats_partial_aus = 0;
+    self->stats_dropped_aus = 0;
+    self->stats_rtp_failures = 0;
+    self->stats_fu_failures = 0;
+    self->stats_truncated_payloads = 0;
+    self->stats_forced_finishes = 0;
+    self->stats_last_report_us = now_us;
 }
