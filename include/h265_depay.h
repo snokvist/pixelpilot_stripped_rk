@@ -5,6 +5,8 @@
 
 G_BEGIN_DECLS
 
+G_DECLARE_FINAL_TYPE(SstarH265Depay, sstar_h265_depay, SSTAR, H265_DEPAY, GstElement)
+
 gboolean sstar_h265_depay_register(void);
 
 G_END_DECLS
