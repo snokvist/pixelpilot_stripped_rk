@@ -87,6 +87,7 @@ LDFLAGS += -lrockchip_mpp
 endif
 
 LDFLAGS += -lpthread
+LDFLAGS += -ldl
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)

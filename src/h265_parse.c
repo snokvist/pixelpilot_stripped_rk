@@ -2,17 +2,10 @@
 
 #include "h265_parse.h"
 
+#include <dlfcn.h>
+
 #include <gst/base/gstbasetransform.h>
 #include <gst/gst.h>
-
-#ifndef G_GNUC_WEAK
-#define G_GNUC_WEAK
-#endif
-
-#if GST_CHECK_VERSION(1, 18, 0)
-G_GNUC_WEAK void gst_base_transform_class_set_passthrough_on_same_caps(GstBaseTransformClass *klass,
-                                                                       gboolean passthrough);
-#endif
 
 GST_DEBUG_CATEGORY_STATIC(sstar_h265_parse_debug);
 #define GST_CAT_DEFAULT sstar_h265_parse_debug
@@ -27,6 +20,29 @@ struct _SstarH265ParseClass {
 };
 
 G_DEFINE_TYPE(SstarH265Parse, sstar_h265_parse, GST_TYPE_BASE_TRANSFORM)
+
+typedef void (*PassthroughHelper)(GstBaseTransformClass *, gboolean);
+
+static PassthroughHelper resolve_passthrough_helper(void) {
+    static gsize once_init = 0;
+    static PassthroughHelper helper = NULL;
+
+    if (g_once_init_enter(&once_init)) {
+        void *symbol = NULL;
+#ifdef RTLD_DEFAULT
+        symbol = dlsym(RTLD_DEFAULT, "gst_base_transform_class_set_passthrough_on_same_caps");
+#else
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle != NULL) {
+            symbol = dlsym(handle, "gst_base_transform_class_set_passthrough_on_same_caps");
+        }
+#endif
+        helper = (PassthroughHelper)symbol;
+        g_once_init_leave(&once_init, 1);
+    }
+
+    return helper;
+}
 
 static GstCaps *sstar_h265_parse_transform_caps(GstBaseTransform *base,
                                                 GstPadDirection direction,
@@ -130,15 +146,12 @@ static void sstar_h265_parse_class_init(SstarH265ParseClass *klass) {
     base_class->transform_caps = sstar_h265_parse_transform_caps;
     base_class->set_caps = sstar_h265_parse_set_caps;
     base_class->transform_ip = sstar_h265_parse_transform_ip;
-#if GST_CHECK_VERSION(1, 18, 0)
-    if (gst_base_transform_class_set_passthrough_on_same_caps != NULL) {
-        gst_base_transform_class_set_passthrough_on_same_caps(base_class, TRUE);
+    PassthroughHelper helper = resolve_passthrough_helper();
+    if (helper != NULL) {
+        helper(base_class, TRUE);
     } else {
         base_class->passthrough_on_same_caps = TRUE;
     }
-#else
-    base_class->passthrough_on_same_caps = TRUE;
-#endif
 }
 
 static void sstar_h265_parse_init(SstarH265Parse *self) {

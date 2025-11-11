@@ -12,15 +12,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <dlfcn.h>
+
 #include <gst/gst.h>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_err.h>
-
-#ifndef G_GNUC_WEAK
-#define G_GNUC_WEAK
-#endif
-
-G_GNUC_WEAK void mpp_packet_set_errinfo(MppPacket packet, RK_U32 errinfo);
 
 #if defined(__has_include)
 #  if __has_include(<rockchip/mpp_packet.h>)
@@ -186,15 +182,34 @@ static inline void copy_packet_data(guint8 *dst, const guint8 *src, size_t size)
 #endif
 }
 
-static inline void set_packet_errinfo_safe(MppPacket packet, gboolean corrupted) {
-#if defined(__GNUC__)
-    if (mpp_packet_set_errinfo != NULL) {
-        mpp_packet_set_errinfo(packet, corrupted ? 1 : 0);
-    }
+typedef void (*MppPacketSetErrinfoFunc)(MppPacket packet, RK_U32 errinfo);
+
+static inline MppPacketSetErrinfoFunc resolve_mpp_packet_set_errinfo(void) {
+    static gsize once_init = 0;
+    static MppPacketSetErrinfoFunc func = NULL;
+
+    if (g_once_init_enter(&once_init)) {
+        void *symbol = NULL;
+#ifdef RTLD_DEFAULT
+        symbol = dlsym(RTLD_DEFAULT, "mpp_packet_set_errinfo");
 #else
-    (void)packet;
-    (void)corrupted;
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle != NULL) {
+            symbol = dlsym(handle, "mpp_packet_set_errinfo");
+        }
 #endif
+        func = (MppPacketSetErrinfoFunc)symbol;
+        g_once_init_leave(&once_init, 1);
+    }
+
+    return func;
+}
+
+static inline void set_packet_errinfo_safe(MppPacket packet, gboolean corrupted) {
+    MppPacketSetErrinfoFunc func = resolve_mpp_packet_set_errinfo();
+    if (func != NULL) {
+        func(packet, corrupted ? 1 : 0);
+    }
 }
 
 static void log_decoder_neon_status_once(void) {
