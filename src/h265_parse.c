@@ -8,14 +8,10 @@
 GST_DEBUG_CATEGORY_STATIC(sstar_h265_parse_debug);
 #define GST_CAT_DEFAULT sstar_h265_parse_debug
 
-typedef struct _SstarH265Parse {
+struct _SstarH265Parse {
     GstBaseTransform parent;
     GstCaps *configured_caps;
-} SstarH265Parse;
-
-typedef struct _SstarH265ParseClass {
-    GstBaseTransformClass parent_class;
-} SstarH265ParseClass;
+};
 
 G_DEFINE_TYPE(SstarH265Parse, sstar_h265_parse, GST_TYPE_BASE_TRANSFORM)
 

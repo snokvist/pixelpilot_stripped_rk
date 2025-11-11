@@ -11,7 +11,7 @@ GST_DEBUG_CATEGORY_STATIC(sstar_h265_depay_debug);
 #define H265_FU_NAL_TYPE 49
 #define RTP_CLOCK_RATE 90000
 
-typedef struct _SstarH265Depay {
+struct _SstarH265Depay {
     GstElement parent;
 
     GstPad *sinkpad;
@@ -33,11 +33,7 @@ typedef struct _SstarH265Depay {
     guint64 base_ts_ext;
 
     gboolean emit_partial_au;
-} SstarH265Depay;
-
-typedef struct _SstarH265DepayClass {
-    GstElementClass parent_class;
-} SstarH265DepayClass;
+};
 
 G_DEFINE_TYPE(SstarH265Depay, sstar_h265_depay, GST_TYPE_ELEMENT)
 
