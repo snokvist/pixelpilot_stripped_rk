@@ -13,6 +13,10 @@ struct _SstarH265Parse {
     GstCaps *configured_caps;
 };
 
+struct _SstarH265ParseClass {
+    GstBaseTransformClass parent_class;
+};
+
 G_DEFINE_TYPE(SstarH265Parse, sstar_h265_parse, GST_TYPE_BASE_TRANSFORM)
 
 static GstCaps *sstar_h265_parse_transform_caps(GstBaseTransform *base,
@@ -117,7 +121,11 @@ static void sstar_h265_parse_class_init(SstarH265ParseClass *klass) {
     base_class->transform_caps = sstar_h265_parse_transform_caps;
     base_class->set_caps = sstar_h265_parse_set_caps;
     base_class->transform_ip = sstar_h265_parse_transform_ip;
+#if GST_CHECK_VERSION(1, 18, 0)
     gst_base_transform_class_set_passthrough_on_same_caps(base_class, TRUE);
+#else
+    base_class->passthrough_on_same_caps = TRUE;
+#endif
 }
 
 static void sstar_h265_parse_init(SstarH265Parse *self) {

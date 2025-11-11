@@ -35,6 +35,10 @@ struct _SstarH265Depay {
     gboolean emit_partial_au;
 };
 
+struct _SstarH265DepayClass {
+    GstElementClass parent_class;
+};
+
 G_DEFINE_TYPE(SstarH265Depay, sstar_h265_depay, GST_TYPE_ELEMENT)
 
 enum {
