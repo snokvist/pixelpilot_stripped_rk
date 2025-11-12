@@ -1,6 +1,8 @@
 #include "pipeline.h"
 
 #include "logging.h"
+#include "h265_depay.h"
+#include "h265_parse.h"
 
 #ifndef GST_USE_UNSTABLE_API
 #define GST_USE_UNSTABLE_API
@@ -121,6 +123,11 @@ static gpointer appsink_thread_func(gpointer data) {
             GstMapInfo map;
             if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
                 if (map.size > 0 && map.size <= max_packet) {
+                    gboolean corrupted = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED);
+                    gboolean discont = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT);
+                    if (discont) {
+                        corrupted = TRUE;
+                    }
                     g_mutex_lock(&ps->recorder_lock);
                     VideoRecorder *recorder = ps->recorder;
                     if (recorder != NULL) {
@@ -128,7 +135,7 @@ static gpointer appsink_thread_func(gpointer data) {
                     }
                     g_mutex_unlock(&ps->recorder_lock);
 
-                    if (video_decoder_feed(ps->decoder, map.data, map.size, pts) != 0) {
+                    if (video_decoder_feed(ps->decoder, map.data, map.size, pts, corrupted, discont) != 0) {
                         LOGV("Video decoder feed busy; retrying");
                     }
                 }
@@ -245,7 +252,6 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     ps->appsink_thread_running = FALSE;
     ps->stop_requested = FALSE;
     ps->encountered_error = FALSE;
-
     GstElement *pipeline = gst_pipeline_new("pixelpilot_stripped_rk");
     CHECK_ELEM(pipeline, "pipeline");
 
@@ -255,26 +261,37 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
         goto fail;
     }
 
+    if (!sstar_h265_depay_register()) {
+        LOGE("Failed to register sstarh265depay element");
+        goto fail;
+    }
+
+    if (!sstar_h265_parse_register()) {
+        LOGE("Failed to register sstarh265parse element");
+        goto fail;
+    }
+
     GstElement *queue = gst_element_factory_make("queue", "udp_queue");
-    GstElement *depay = gst_element_factory_make("rtph265depay", "video_depay");
-    GstElement *parser = gst_element_factory_make("h265parse", "video_parser");
+    GstElement *depay = gst_element_factory_make("sstarh265depay", "video_depay");
+    GstElement *parser = gst_element_factory_make("sstarh265parse", "video_parser");
     GstElement *capsfilter = gst_element_factory_make("capsfilter", "video_capsfilter");
     GstElement *appsink = gst_element_factory_make("appsink", "video_sink");
 
     CHECK_ELEM(queue, "queue");
-    CHECK_ELEM(depay, "rtph265depay");
-    CHECK_ELEM(parser, "h265parse");
+    CHECK_ELEM(depay, "sstarh265depay");
+    CHECK_ELEM(parser, "sstarh265parse");
     CHECK_ELEM(capsfilter, "capsfilter");
     CHECK_ELEM(appsink, "appsink");
+
+    if (cfg->vid_pt >= -1 && cfg->vid_pt <= 127) {
+        g_object_set(depay, "payload-type", cfg->vid_pt, NULL);
+    }
+    g_object_set(depay, "emit-partial-au", TRUE, NULL);
 
     guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 4u;
     gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), max_buffers);
     gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);
     g_object_set(appsink, "sync", FALSE, NULL);
-
-    g_object_set(parser, "config-interval", -1, "disable-passthrough", TRUE, NULL);
-    gst_util_set_object_arg(G_OBJECT(parser), "stream-format", "byte-stream");
-    gst_util_set_object_arg(G_OBJECT(parser), "alignment", "au");
 
     GstCaps *raw_caps = gst_caps_new_simple("video/x-h265",
                                             "stream-format", G_TYPE_STRING, "byte-stream",
