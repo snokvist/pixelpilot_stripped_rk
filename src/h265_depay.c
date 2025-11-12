@@ -26,11 +26,13 @@ struct _SstarH265Depay {
     gboolean have_au;
     gboolean have_last_ts;
     gboolean have_base_ts;
+    gboolean have_last_seq;
 
     guint32 current_timestamp;
     guint64 au_timestamp_ext;
     guint64 last_ts_ext;
     guint64 base_ts_ext;
+    guint16 last_seq;
 
     gboolean emit_partial_au;
 };
@@ -54,6 +56,14 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
 static gboolean sstar_h265_depay_sink_event(GstPad *pad, GstObject *parent, GstEvent *event);
 static GstCaps *sstar_h265_depay_build_src_caps(void);
 static void sstar_h265_depay_mark_corruption(SstarH265Depay *self);
+
+typedef enum {
+    SEQ_STATUS_OK,
+    SEQ_STATUS_DUPLICATE,
+    SEQ_STATUS_GAP
+} SstarH265DepaySeqStatus;
+
+static SstarH265DepaySeqStatus sstar_h265_depay_track_sequence(SstarH265Depay *self, guint16 seq);
 
 static inline guint64 extend_timestamp(SstarH265Depay *self, guint32 ts) {
     if (!self->have_last_ts) {
@@ -389,7 +399,14 @@ static GstFlowReturn sstar_h265_depay_chain(GstPad *pad, GstObject *parent, GstB
         goto done;
     }
 
-    (void)seq;
+    SstarH265DepaySeqStatus seq_status = sstar_h265_depay_track_sequence(self, seq);
+    if (seq_status == SEQ_STATUS_DUPLICATE) {
+        goto done;
+    }
+    if (seq_status == SEQ_STATUS_GAP) {
+        sstar_h265_depay_mark_corruption(self);
+        drop_current_fu(self);
+    }
 
     guint64 ts_ext = extend_timestamp(self, timestamp);
 
@@ -515,10 +532,12 @@ static void sstar_h265_depay_reset_state(SstarH265Depay *self) {
     self->have_au = FALSE;
     self->have_last_ts = FALSE;
     self->have_base_ts = FALSE;
+    self->have_last_seq = FALSE;
     self->current_timestamp = 0;
     self->au_timestamp_ext = 0;
     self->last_ts_ext = 0;
     self->base_ts_ext = 0;
+    self->last_seq = 0;
 }
 
 static GstStaticPadTemplate sink_template =
@@ -586,10 +605,12 @@ static void sstar_h265_depay_init(SstarH265Depay *self) {
     self->have_au = FALSE;
     self->have_last_ts = FALSE;
     self->have_base_ts = FALSE;
+    self->have_last_seq = FALSE;
     self->current_timestamp = 0;
     self->au_timestamp_ext = 0;
     self->last_ts_ext = 0;
     self->base_ts_ext = 0;
+    self->last_seq = 0;
     self->emit_partial_au = FALSE;
 }
 
@@ -610,4 +631,28 @@ static void sstar_h265_depay_mark_corruption(SstarH265Depay *self) {
     if (self != NULL) {
         self->au_corrupted = TRUE;
     }
+}
+
+static SstarH265DepaySeqStatus sstar_h265_depay_track_sequence(SstarH265Depay *self, guint16 seq) {
+    if (self == NULL) {
+        return SEQ_STATUS_OK;
+    }
+
+    if (!self->have_last_seq) {
+        self->have_last_seq = TRUE;
+        self->last_seq = seq;
+        return SEQ_STATUS_OK;
+    }
+
+    guint16 prev = self->last_seq;
+    self->last_seq = seq;
+
+    guint16 step = (guint16)(seq - prev);
+    if (step == 0) {
+        return SEQ_STATUS_DUPLICATE;
+    }
+    if (step == 1) {
+        return SEQ_STATUS_OK;
+    }
+    return SEQ_STATUS_GAP;
 }
