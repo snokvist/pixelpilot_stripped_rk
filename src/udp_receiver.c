@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -99,7 +101,14 @@ static gpointer receiver_thread(gpointer data) {
             break;
         }
 
-        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, 0);
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        struct iovec iov;
+        iov.iov_base = buffer;
+        iov.iov_len = UDP_MAX_PACKET;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        ssize_t n = recvmsg(ur->sockfd, &msg, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 continue;
@@ -110,6 +119,11 @@ static gpointer receiver_thread(gpointer data) {
         if (n == 0) {
             continue;
         }
+
+        if ((msg.msg_flags & MSG_TRUNC) != 0) {
+            continue;
+        }
+
         if (!payload_type_matches(buffer, n, ur->vid_pt)) {
             continue;
         }
@@ -177,7 +191,6 @@ UdpReceiver *udp_receiver_create(int udp_port, int vid_pt, GstAppSrc *video_apps
     ur->thread = NULL;
     ur->pool = NULL;
     ur->pool_active = FALSE;
-
     return ur;
 }
 
